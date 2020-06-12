@@ -118,3 +118,7 @@ Desktop.ini
 
 # Pycharm project files
 *.idea
+report.html
+assets/*
+build/*
+spacy/lang/zh/texsmart/data/*
