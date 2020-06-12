@@ -285,3 +285,40 @@ python -m pytest <spacy-directory>
 
 See [the documentation](https://spacy.io/usage#tests) for more details and
 examples.
+
+## 使用中文模型
+
+1. 加载链接[中文模型](https://github.com/howl-anderson/Chinese_models_for_SpaCy)
+2. 使用腾讯AI-NLU SDK `textsmart`
+  + 分词
+  + 使用`textsmart`的NER
+
+```python
+import spacy
+from spacy.lang.zh.texsmart import TextSmart
+
+nlp = spacy.load("zh")
+text = "伟大领袖毛泽东告诉我们，北京市丰台区新增2例新冠肺炎确诊病例"
+
+def _to_name(x):
+    return x.split('.')[0].upper()
+
+def tct_entities(doc, i18n=True):
+    """重写命名实体"""
+    new_ents = []
+    ents = TextSmart.get_entities(doc.text)
+    for en in ents:
+        name = en.type.i18n if i18n else en.type.name
+        new_ent = doc.char_span(en.offset, en.offset + en.len, name)
+        new_ents.append(new_ent)
+    doc.ents = new_ents
+    return doc
+
+# Add the component after the named entity recognizer
+nlp.add_pipe(tct_entities, after='ner')
+
+doc = nlp(text)
+
+from spacy import displacy
+displacy.render(doc, style="ent")
+```
