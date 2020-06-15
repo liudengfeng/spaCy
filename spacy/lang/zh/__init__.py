@@ -35,7 +35,7 @@ class ChineseTokenizer(DummyTokenizer):
     def __init__(self, cls, nlp=None, config={}):
         self.use_tct = config.get("use_tct", cls.use_tct)
         self.require_online = config.get("require_online", cls.require_online)
-        print(f'Tencet Textsmart {"在线" if self.require_online else "离线"}模式')
+        print(f'Tencent Textsmart {"在线" if self.require_online else "离线"}模式')
         self.vocab = nlp.vocab if nlp is not None else cls.create_vocab(nlp)
         self.tct_seg = try_tct_import(self.require_online)
         # remove relevant settings from config so they're not also saved in
