@@ -22,7 +22,6 @@ def try_tct_import(require_online):
     if require_online:
         # 如果在线api异常，使用离线模式
         try:
-            # TODO:检验长度
             assert len(ts.lcut('国务院总理李克强毕业于北京大学。')) == 9, 'len(tokens) != 9'
             # 默认使用在线api
             return ts.lcut
