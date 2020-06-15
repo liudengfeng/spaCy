@@ -1,25 +1,27 @@
-import sys
-import os.path
-module_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(module_dir + '/lib/')
-from tencent_ai_texsmart import *
-
-print('创建和初始化腾讯AI-NLU引擎...')
-# 默认为串行
-engine = NluEngine(module_dir + '/data/nlu/kb/', 1)
-# disable fine-grained NER，加快解析速度
-options = '{"ner":{"enable":true,"fine_grained":false}}'
+from . import online
 
 
 class TextSmart(object):
     """腾讯AI文本处理工具"""
-    @staticmethod
-    def cut(text):
-        output = engine.parse_text_ext(text, options)
-        return [w.str for w in output.words()]
+    def __init__(self, use_online=True):
+        self.use_online = use_online
+        if use_online:
+            self.mod = online
+        else:
+            from . import offline
+            self.mod = offline
 
-    @staticmethod
-    def cut_word(text, coarse=False):
+    def lcut(self, text):
+        """分词列表"""
+        return self.mod.lcut(text)
+
+    def get_entities(self, text):
+        """命名实体列表"""
+        return self.mod.entities(text)
+
+    # TODO:废除以下部分
+    @classmethod
+    def cut_word(cls, text, coarse=False):
         """切词并以空格连接返回文本
 
         Args:
@@ -33,8 +35,8 @@ class TextSmart(object):
         iter_ = output.phrases() if coarse else output.words()
         return ' '.join([w.str for w in iter_])
 
-    @staticmethod
-    def tag_word(text, coarse=False):
+    @classmethod
+    def tag_word(cls, text, coarse=False):
         """分词标注
 
         Args:
@@ -48,8 +50,8 @@ class TextSmart(object):
         iter_ = output.phrases() if coarse else output.words()
         return [(w.str, w.tag) for w in iter_]
 
-    @staticmethod
-    def ner(text):
+    @classmethod
+    def ner(cls, text):
         """命名实体
 
         Args:
@@ -59,8 +61,3 @@ class TextSmart(object):
         """
         output = engine.parse_text_ext(text, options)
         return [(en.str, en.type.i18n) for en in output.entities()]
-
-    @staticmethod
-    def get_entities(text):
-        output = engine.parse_text_ext(text, options)
-        return output.entities()

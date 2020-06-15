@@ -295,27 +295,25 @@ examples.
 
 ```python
 import spacy
+from spacy.lang.zh import Chinese
 from spacy.lang.zh.texsmart import TextSmart
 
-nlp = spacy.load("zh")
+nlp = Chinese()
+ts = TextSmart() # 默认使用在线模式
+
 text = "伟大领袖毛泽东告诉我们，北京市丰台区新增2例新冠肺炎确诊病例"
 
-def _to_name(x):
-    return x.split('.')[0].upper()
-
-def tct_entities(doc, i18n=True):
+def tct_entities(doc):
     """重写命名实体"""
     new_ents = []
-    ents = TextSmart.get_entities(doc.text)
-    for en in ents:
-        name = en.type.i18n if i18n else en.type.name
-        new_ent = doc.char_span(en.offset, en.offset + en.len, name)
+    spans = ts.get_entities(text)
+    for en in spans:
+        new_ent = doc.char_span(en[0], en[1], en[2])
         new_ents.append(new_ent)
     doc.ents = new_ents
     return doc
 
-# Add the component after the named entity recognizer
-nlp.add_pipe(tct_entities, after='ner')
+nlp.add_pipe(tct_entities, name='tct_ner')
 
 doc = nlp(text)
 
