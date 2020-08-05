@@ -33,6 +33,7 @@ from .._ml import build_text_classifier, build_simple_cnn_text_classifier
 from .._ml import build_bow_text_classifier, build_nel_encoder
 from .._ml import link_vectors_to_models, zero_init, flatten
 from .._ml import masked_language_model, create_default_optimizer, get_cossim_loss
+from .._ml import MultiSoftmax, get_characters_loss
 from ..errors import Errors, TempErrors, Warnings
 from .. import util
 
@@ -516,6 +517,14 @@ class Tagger(Pipe):
         lemma_tables = ["lemma_rules", "lemma_index", "lemma_exc", "lemma_lookup"]
         if not any(table in self.vocab.lookups for table in lemma_tables):
             warnings.warn(Warnings.W022)
+        if len(self.vocab.lookups.get_table("lexeme_norm", {})) == 0:
+            warnings.warn(Warnings.W033.format(model="part-of-speech tagger"))
+            try:
+                import spacy_lookups_data
+            except ImportError:
+                if self.vocab.lang in ("da", "de", "el", "en", "id", "lb", "pt",
+                        "ru", "sr", "ta", "th"):
+                    warnings.warn(Warnings.W034.format(lang=self.vocab.lang))
         orig_tag_map = dict(self.vocab.morphology.tag_map)
         new_tag_map = OrderedDict()
         for raw_text, annots_brackets in get_gold_tuples():
@@ -528,6 +537,8 @@ class Tagger(Pipe):
                         new_tag_map[tag] = {POS: X}
         cdef Vocab vocab = self.vocab
         if new_tag_map:
+            if "_SP" in orig_tag_map:
+                new_tag_map["_SP"] = orig_tag_map["_SP"]
             vocab.morphology = Morphology(vocab.strings, new_tag_map,
                                           vocab.morphology.lemmatizer,
                                           exc=vocab.morphology.exc)
@@ -842,11 +853,15 @@ class MultitaskObjective(Tagger):
 class ClozeMultitask(Pipe):
     @classmethod
     def Model(cls, vocab, tok2vec, **cfg):
-        output_size = vocab.vectors.data.shape[1]
-        output_layer = chain(
-            LayerNorm(Maxout(output_size, tok2vec.nO, pieces=3)),
-            zero_init(Affine(output_size, output_size, drop_factor=0.0))
-        )
+        if cfg["objective"] == "characters":
+            out_sizes = [256] * cfg.get("nr_char", 4)
+            output_layer = MultiSoftmax(out_sizes)
+        else:
+            output_size = vocab.vectors.data.shape[1]
+            output_layer = chain(
+                LayerNorm(Maxout(output_size, tok2vec.nO, pieces=3)),
+                zero_init(Affine(output_size, output_size, drop_factor=0.0))
+            )
         model = chain(tok2vec, output_layer)
         model = masked_language_model(vocab, model)
         model.tok2vec = tok2vec
@@ -857,6 +872,8 @@ class ClozeMultitask(Pipe):
         self.vocab = vocab
         self.model = model
         self.cfg = cfg
+        self.cfg.setdefault("objective", "characters")
+        self.cfg.setdefault("nr_char", 4)
 
     def set_annotations(self, docs, dep_ids, tensors=None):
         pass
@@ -865,7 +882,8 @@ class ClozeMultitask(Pipe):
                         tok2vec=None, sgd=None, **kwargs):
         link_vectors_to_models(self.vocab)
         if self.model is True:
-            self.model = self.Model(self.vocab, tok2vec)
+            kwargs.update(self.cfg)
+            self.model = self.Model(self.vocab, tok2vec, **kwargs)
         X = self.model.ops.allocate((5, self.model.tok2vec.nO))
         self.model.output_layer.begin_training(X)
         if sgd is None:
@@ -879,13 +897,16 @@ class ClozeMultitask(Pipe):
         return tokvecs, vectors
 
     def get_loss(self, docs, vectors, prediction):
-        # The simplest way to implement this would be to vstack the
-        # token.vector values, but that's a bit inefficient, especially on GPU.
-        # Instead we fetch the index into the vectors table for each of our tokens,
-        # and look them up all at once. This prevents data copying.
-        ids = self.model.ops.flatten([doc.to_array(ID).ravel() for doc in docs])
-        target = vectors[ids]
-        loss, gradient = get_cossim_loss(prediction, target, ignore_zeros=True)
+        if self.cfg["objective"] == "characters":
+            loss, gradient = get_characters_loss(self.model.ops, docs, prediction)
+        else:
+            # The simplest way to implement this would be to vstack the
+            # token.vector values, but that's a bit inefficient, especially on GPU.
+            # Instead we fetch the index into the vectors table for each of our tokens,
+            # and look them up all at once. This prevents data copying.
+            ids = self.model.ops.flatten([doc.to_array(ID).ravel() for doc in docs])
+            target = vectors[ids]
+            loss, gradient = get_cossim_loss(prediction, target, ignore_zeros=True)
         return float(loss), gradient
 
     def update(self, docs, golds, drop=0., sgd=None, losses=None):
@@ -901,6 +922,20 @@ class ClozeMultitask(Pipe):
 
         if losses is not None:
             losses[self.name] += loss
+
+    @staticmethod
+    def decode_utf8_predictions(char_array):
+        # The format alternates filling from start and end, and 255 is missing
+        words = []
+        char_array = char_array.reshape((char_array.shape[0], -1, 256))
+        nr_char = char_array.shape[1]
+        char_array = char_array.argmax(axis=-1)
+        for row in char_array:
+            starts = [chr(c) for c in row[::2] if c != 255]
+            ends = [chr(c) for c in row[1::2] if c != 255]
+            word = "".join(starts + list(reversed(ends)))
+            words.append(word)
+        return words
 
 
 @component("textcat", assigns=["doc.cats"])
@@ -1065,6 +1100,7 @@ cdef class DependencyParser(Parser):
     assigns = ["token.dep", "token.is_sent_start", "doc.sents"]
     requires = []
     TransitionSystem = ArcEager
+    nr_feature = 8
 
     @property
     def postprocesses(self):
@@ -1168,6 +1204,9 @@ class EntityLinker(Pipe):
         self.model = True
         self.kb = None
         self.cfg = dict(cfg)
+        
+        # how many neightbour sentences to take into account
+        self.n_sents = cfg.get("n_sents", 0)
 
     def set_kb(self, kb):
         self.kb = kb
@@ -1216,6 +1255,9 @@ class EntityLinker(Pipe):
 
         for doc, gold in zip(docs, golds):
             ents_by_offset = dict()
+
+            sentences = [s for s in doc.sents]
+
             for ent in doc.ents:
                 ents_by_offset[(ent.start_char, ent.end_char)] = ent
 
@@ -1226,16 +1268,33 @@ class EntityLinker(Pipe):
                 # the gold annotations should link to proper entities - if this fails, the dataset is likely corrupt
                 if not (start, end) in ents_by_offset:
                     raise RuntimeError(Errors.E188)
+
                 ent = ents_by_offset[(start, end)]
 
                 for kb_id, value in kb_dict.items():
                     # Currently only training on the positive instances
                     if value:
                         try:
-                            sentence_docs.append(ent.sent.as_doc())
+                            # find the sentence in the list of sentences.
+                            sent_index = sentences.index(ent.sent)
+
                         except AttributeError:
                             # Catch the exception when ent.sent is None and provide a user-friendly warning
                             raise RuntimeError(Errors.E030)
+
+                        # get n previous sentences, if there are any
+                        start_sentence = max(0, sent_index - self.n_sents)
+
+                        # get n posterior sentences, or as many < n as there are
+                        end_sentence = min(len(sentences) -1, sent_index + self.n_sents)
+
+                        # get token positions
+                        start_token = sentences[start_sentence].start
+                        end_token = sentences[end_sentence].end
+
+                        # append that span as a doc to training
+                        sent_doc = doc[start_token:end_token].as_doc()
+                        sentence_docs.append(sent_doc)   
 
         sentence_encodings, bp_context = self.model.begin_update(sentence_docs, drop=drop)
         loss, d_scores = self.get_similarity_loss(scores=sentence_encodings, golds=golds, docs=None)
@@ -1307,69 +1366,81 @@ class EntityLinker(Pipe):
         if isinstance(docs, Doc):
             docs = [docs]
 
+
         for i, doc in enumerate(docs):
+            sentences = [s for s in doc.sents]
+
             if len(doc) > 0:
                 # Looping through each sentence and each entity
                 # This may go wrong if there are entities across sentences - which shouldn't happen normally.
-                for sent in doc.sents:
-                    sent_doc = sent.as_doc()
-                    # currently, the context is the same for each entity in a sentence (should be refined)
-                    sentence_encoding = self.model([sent_doc])[0]
-                    xp = get_array_module(sentence_encoding)
-                    sentence_encoding_t = sentence_encoding.T
-                    sentence_norm = xp.linalg.norm(sentence_encoding_t)
+                for sent_index, sent in enumerate(sentences):
+                    if sent.ents:
+                        # get n_neightbour sentences, clipped to the length of the document
+                        start_sentence = max(0, sent_index - self.n_sents)
+                        end_sentence = min(len(sentences) -1, sent_index + self.n_sents)
 
-                    for ent in sent_doc.ents:
-                        entity_count += 1
+                        start_token = sentences[start_sentence].start
+                        end_token = sentences[end_sentence].end
 
-                        to_discard = self.cfg.get("labels_discard", [])
-                        if to_discard and ent.label_ in to_discard:
-                            # ignoring this entity - setting to NIL
-                            final_kb_ids.append(self.NIL)
-                            final_tensors.append(sentence_encoding)
+                        sent_doc = doc[start_token:end_token].as_doc()
 
-                        else:
-                            candidates = self.kb.get_candidates(ent.text)
-                            if not candidates:
-                                # no prediction possible for this entity - setting to NIL
+                        # currently, the context is the same for each entity in a sentence (should be refined)
+                        sentence_encoding = self.model([sent_doc])[0]
+                        xp = get_array_module(sentence_encoding)
+                        sentence_encoding_t = sentence_encoding.T
+                        sentence_norm = xp.linalg.norm(sentence_encoding_t)
+
+                        for ent in sent.ents:
+                            entity_count += 1
+
+                            to_discard = self.cfg.get("labels_discard", [])
+                            if to_discard and ent.label_ in to_discard:
+                                # ignoring this entity - setting to NIL
                                 final_kb_ids.append(self.NIL)
                                 final_tensors.append(sentence_encoding)
 
-                            elif len(candidates) == 1:
-                                # shortcut for efficiency reasons: take the 1 candidate
-
-                                # TODO: thresholding
-                                final_kb_ids.append(candidates[0].entity_)
-                                final_tensors.append(sentence_encoding)
-
                             else:
-                                random.shuffle(candidates)
+                                candidates = self.kb.get_candidates(ent.text)
+                                if not candidates:
+                                    # no prediction possible for this entity - setting to NIL
+                                    final_kb_ids.append(self.NIL)
+                                    final_tensors.append(sentence_encoding)
 
-                                # this will set all prior probabilities to 0 if they should be excluded from the model
-                                prior_probs = xp.asarray([c.prior_prob for c in candidates])
-                                if not self.cfg.get("incl_prior", True):
-                                    prior_probs = xp.asarray([0.0 for c in candidates])
-                                scores = prior_probs
+                                elif len(candidates) == 1:
+                                    # shortcut for efficiency reasons: take the 1 candidate
 
-                                # add in similarity from the context
-                                if self.cfg.get("incl_context", True):
-                                    entity_encodings = xp.asarray([c.entity_vector for c in candidates])
-                                    entity_norm = xp.linalg.norm(entity_encodings, axis=1)
+                                    # TODO: thresholding
+                                    final_kb_ids.append(candidates[0].entity_)
+                                    final_tensors.append(sentence_encoding)
 
-                                    if len(entity_encodings) != len(prior_probs):
-                                        raise RuntimeError(Errors.E147.format(method="predict", msg="vectors not of equal length"))
+                                else:
+                                    random.shuffle(candidates)
 
-                                    # cosine similarity
-                                    sims = xp.dot(entity_encodings, sentence_encoding_t) / (sentence_norm * entity_norm)
-                                    if sims.shape != prior_probs.shape:
-                                        raise ValueError(Errors.E161)
-                                    scores = prior_probs + sims - (prior_probs*sims)
+                                    # this will set all prior probabilities to 0 if they should be excluded from the model
+                                    prior_probs = xp.asarray([c.prior_prob for c in candidates])
+                                    if not self.cfg.get("incl_prior", True):
+                                        prior_probs = xp.asarray([0.0 for c in candidates])
+                                    scores = prior_probs
 
-                                # TODO: thresholding
-                                best_index = scores.argmax()
-                                best_candidate = candidates[best_index]
-                                final_kb_ids.append(best_candidate.entity_)
-                                final_tensors.append(sentence_encoding)
+                                    # add in similarity from the context
+                                    if self.cfg.get("incl_context", True):
+                                        entity_encodings = xp.asarray([c.entity_vector for c in candidates])
+                                        entity_norm = xp.linalg.norm(entity_encodings, axis=1)
+
+                                        if len(entity_encodings) != len(prior_probs):
+                                            raise RuntimeError(Errors.E147.format(method="predict", msg="vectors not of equal length"))
+
+                                        # cosine similarity
+                                        sims = xp.dot(entity_encodings, sentence_encoding_t) / (sentence_norm * entity_norm)
+                                        if sims.shape != prior_probs.shape:
+                                            raise ValueError(Errors.E161)
+                                        scores = prior_probs + sims - (prior_probs*sims)
+
+                                    # TODO: thresholding
+                                    best_index = scores.argmax()
+                                    best_candidate = candidates[best_index]
+                                    final_kb_ids.append(best_candidate.entity_)
+                                    final_tensors.append(sentence_encoding)
 
         if not (len(final_tensors) == len(final_kb_ids) == entity_count):
             raise RuntimeError(Errors.E147.format(method="predict", msg="result variables not of equal length"))
