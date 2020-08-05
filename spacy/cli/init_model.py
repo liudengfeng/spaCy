@@ -117,7 +117,6 @@ def init_model(
         "Sucessfully compiled vocab",
         "{} entries, {} vectors".format(lex_added, vec_added),
     )
-    output_dir = ensure_path(output_dir)
     if not output_dir.exists():
         output_dir.mkdir()
     nlp.to_disk(output_dir)
