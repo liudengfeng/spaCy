@@ -471,7 +471,7 @@ doc = nlp.make_doc("London is a big city in the United Kingdom.")
 print("Before", doc.ents)  # []
 
 header = [ENT_IOB, ENT_TYPE]
-attr_array = numpy.zeros((len(doc), len(header)))
+attr_array = numpy.zeros((len(doc), len(header)), dtype="uint64")
 attr_array[0, 0] = 3  # B
 attr_array[0, 1] = doc.vocab.strings["GPE"]
 doc.from_array(header, attr_array)
@@ -732,7 +732,7 @@ rather than performance:
 
 ```python
 def tokenizer_pseudo_code(self, special_cases, prefix_search, suffix_search,
-                          infix_finditer, token_match):
+                          infix_finditer, token_match, url_match):
     tokens = []
     for substring in text.split():
         suffixes = []
@@ -829,7 +829,7 @@ for t in tok_exp:
 ### Customizing spaCy's Tokenizer class {#native-tokenizers}
 
 Let's imagine you wanted to create a tokenizer for a new language or specific
-domain. There are five things you would need to define:
+domain. There are six things you may need to define:
 
 1. A dictionary of **special cases**. This handles things like contractions,
    units of measurement, emoticons, certain abbreviations, etc.
@@ -840,9 +840,22 @@ domain. There are five things you would need to define:
 4. A function `infixes_finditer`, to handle non-whitespace separators, such as
    hyphens etc.
 5. An optional boolean function `token_match` matching strings that should never
-   be split, overriding the infix rules. Useful for things like URLs or numbers.
+   be split, overriding the infix rules. Useful for things like numbers.
 6. An optional boolean function `url_match`, which is similar to `token_match`
-   except prefixes and suffixes are removed before applying the match.
+   except that prefixes and suffixes are removed before applying the match.
+ 
+<Infobox title="Important note: token match in spaCy v2.2" variant="warning">
+
+In spaCy v2.2.2-v2.2.4, the `token_match` was equivalent to the `url_match`
+above and there was no match pattern applied before prefixes and suffixes were
+analyzed. As of spaCy v2.3.0, the `token_match` has been reverted to its
+behavior in v2.2.1 and earlier with precedence over prefixes and suffixes.
+
+The `url_match` is introduced in v2.3.0 to handle cases like URLs where the
+tokenizer should remove prefixes and suffixes (e.g., a comma at the end of a
+URL) before applying the match.
+
+</Infobox>
 
 You shouldn't usually need to create a `Tokenizer` subclass. Standard usage is
 to use `re.compile()` to build a regular expression object, and pass its
@@ -865,7 +878,7 @@ def custom_tokenizer(nlp):
                                 prefix_search=prefix_re.search,
                                 suffix_search=suffix_re.search,
                                 infix_finditer=infix_re.finditer,
-                                token_match=simple_url_re.match)
+                                url_match=simple_url_re.match)
 
 nlp = spacy.load("en_core_web_sm")
 nlp.tokenizer = custom_tokenizer(nlp)
@@ -1130,9 +1143,9 @@ from spacy.gold import align
 other_tokens = ["i", "listened", "to", "obama", "'", "s", "podcasts", "."]
 spacy_tokens = ["i", "listened", "to", "obama", "'s", "podcasts", "."]
 cost, a2b, b2a, a2b_multi, b2a_multi = align(other_tokens, spacy_tokens)
-print("Misaligned tokens:", cost)  # 2
+print("Edit distance:", cost)  # 3
 print("One-to-one mappings a -> b", a2b)  # array([0, 1, 2, 3, -1, -1, 5, 6])
-print("One-to-one mappings b -> a", b2a)  # array([0, 1, 2, 3, 5, 6, 7])
+print("One-to-one mappings b -> a", b2a)  # array([0, 1, 2, 3, -1, 6, 7])
 print("Many-to-one mappings a -> b", a2b_multi)  # {4: 4, 5: 4}
 print("Many-to-one mappings b-> a", b2a_multi)  # {}
 ```
@@ -1140,7 +1153,7 @@ print("Many-to-one mappings b-> a", b2a_multi)  # {}
 Here are some insights from the alignment information generated in the example
 above:
 
-- Two tokens are misaligned.
+- The edit distance (cost) is `3`: two deletions and one insertion.
 - The one-to-one mappings for the first four tokens are identical, which means
   they map to each other. This makes sense because they're also identical in the
   input: `"i"`, `"listened"`, `"to"` and `"obama"`.
